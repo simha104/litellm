@@ -22,6 +22,7 @@ from typing import (
     overload,
 )
 
+from litellm.constants import MAX_TEAM_LIST_LIMIT
 from litellm.proxy._types import (
     DB_CONNECTION_ERROR_TYPES,
     CommonProxyErrors,
@@ -75,6 +76,7 @@ from litellm.proxy.db.create_views import (
 from litellm.proxy.db.db_spend_update_writer import DBSpendUpdateWriter
 from litellm.proxy.db.log_db_metrics import log_db_metrics
 from litellm.proxy.db.prisma_client import PrismaWrapper
+from litellm.proxy.hooks import PROXY_HOOKS, get_proxy_hook
 from litellm.proxy.hooks.cache_control_check import _PROXY_CacheControlCheck
 from litellm.proxy.hooks.max_budget_limiter import _PROXY_MaxBudgetLimiter
 from litellm.proxy.hooks.parallel_request_limiter import (
@@ -83,7 +85,7 @@ from litellm.proxy.hooks.parallel_request_limiter import (
 from litellm.proxy.litellm_pre_call_utils import LiteLLMProxyRequestSetup
 from litellm.secret_managers.main import str_to_bool
 from litellm.types.integrations.slack_alerting import DEFAULT_ALERT_TYPES
-from litellm.types.utils import CallTypes, LoggedLiteLLMParams
+from litellm.types.utils import CallTypes, LLMResponseTypes, LoggedLiteLLMParams
 
 if TYPE_CHECKING:
     from opentelemetry.trace import Span as _Span
@@ -276,6 +278,7 @@ class ProxyLogging:
         self.premium_user = premium_user
         self.service_logging_obj = ServiceLogging()
         self.db_spend_update_writer = DBSpendUpdateWriter()
+        self.proxy_hook_mapping: Dict[str, CustomLogger] = {}
 
     def startup_event(
         self,
@@ -349,11 +352,37 @@ class ProxyLogging:
         if redis_cache is not None:
             self.internal_usage_cache.dual_cache.redis_cache = redis_cache
             self.db_spend_update_writer.redis_update_buffer.redis_cache = redis_cache
+            self.db_spend_update_writer.pod_lock_manager.redis_cache = redis_cache
+
+    def _add_proxy_hooks(self, llm_router: Optional[Router] = None):
+        """
+        Add proxy hooks to litellm.callbacks
+        """
+        from litellm.proxy.proxy_server import prisma_client
+
+        for hook in PROXY_HOOKS:
+            proxy_hook = get_proxy_hook(hook)
+            import inspect
+
+            expected_args = inspect.getfullargspec(proxy_hook).args
+            passed_in_args: Dict[str, Any] = {}
+            if "internal_usage_cache" in expected_args:
+                passed_in_args["internal_usage_cache"] = self.internal_usage_cache
+            if "prisma_client" in expected_args:
+                passed_in_args["prisma_client"] = prisma_client
+            proxy_hook_obj = cast(CustomLogger, proxy_hook(**passed_in_args))
+            litellm.logging_callback_manager.add_litellm_callback(proxy_hook_obj)
+
+            self.proxy_hook_mapping[hook] = proxy_hook_obj
+
+    def get_proxy_hook(self, hook: str) -> Optional[CustomLogger]:
+        """
+        Get a proxy hook from the proxy_hook_mapping
+        """
+        return self.proxy_hook_mapping.get(hook)
 
     def _init_litellm_callbacks(self, llm_router: Optional[Router] = None):
-        litellm.logging_callback_manager.add_litellm_callback(self.max_parallel_request_limiter)  # type: ignore
-        litellm.logging_callback_manager.add_litellm_callback(self.max_budget_limiter)  # type: ignore
-        litellm.logging_callback_manager.add_litellm_callback(self.cache_control_check)  # type: ignore
+        self._add_proxy_hooks(llm_router)
         litellm.logging_callback_manager.add_litellm_callback(self.service_logging_obj)  # type: ignore
         for callback in litellm.callbacks:
             if isinstance(callback, str):
@@ -928,7 +957,7 @@ class ProxyLogging:
     async def post_call_success_hook(
         self,
         data: dict,
-        response: Union[ModelResponse, EmbeddingResponse, ImageResponse],
+        response: LLMResponseTypes,
         user_api_key_dict: UserAPIKeyAuth,
     ):
         """
@@ -936,6 +965,9 @@ class ProxyLogging:
 
         Covers:
         1. /chat/completions
+        2. /embeddings
+        3. /image/generation
+        4. /files
         """
 
         for callback in litellm.callbacks:
@@ -1595,7 +1627,9 @@ class PrismaClient:
                         where={"team_id": {"in": team_id_list}}
                     )
                 elif query_type == "find_all" and team_id_list is None:
-                    response = await self.db.litellm_teamtable.find_many(take=20)
+                    response = await self.db.litellm_teamtable.find_many(
+                        take=MAX_TEAM_LIST_LIMIT
+                    )
                 return response
             elif table_name == "user_notification":
                 if query_type == "find_unique":
@@ -2762,50 +2796,3 @@ def _premium_user_check():
                 "error": f"This feature is only available for LiteLLM Enterprise users. {CommonProxyErrors.not_premium_user.value}"
             },
         )
-
-
-async def _update_daily_spend_batch(prisma_client, spend_aggregates):
-    """Helper function to update daily spend in batches"""
-    async with prisma_client.db.batch_() as batcher:
-        for (
-            user_id,
-            date,
-            api_key,
-            model,
-            model_group,
-            provider,
-        ), metrics in spend_aggregates.items():
-            if not user_id:  # Skip if no user_id
-                continue
-
-            batcher.litellm_dailyuserspend.upsert(
-                where={
-                    "user_id_date_api_key_model_custom_llm_provider": {
-                        "user_id": user_id,
-                        "date": date,
-                        "api_key": api_key,
-                        "model": model,
-                        "custom_llm_provider": provider,
-                    }
-                },
-                data={
-                    "create": {
-                        "user_id": user_id,
-                        "date": date,
-                        "api_key": api_key,
-                        "model": model,
-                        "model_group": model_group,
-                        "custom_llm_provider": provider,
-                        "prompt_tokens": metrics["prompt_tokens"],
-                        "completion_tokens": metrics["completion_tokens"],
-                        "spend": metrics["spend"],
-                    },
-                    "update": {
-                        "prompt_tokens": {"increment": metrics["prompt_tokens"]},
-                        "completion_tokens": {
-                            "increment": metrics["completion_tokens"]
-                        },
-                        "spend": {"increment": metrics["spend"]},
-                    },
-                },
-            )

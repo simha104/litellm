@@ -1,8 +1,10 @@
 import json
 import os
 import sys
-
+import httpx
 import pytest
+import respx
+
 from fastapi.testclient import TestClient
 
 sys.path.insert(
@@ -259,3 +261,125 @@ def test_bedrock_latency_optimized_inference():
         mock_post.assert_called_once()
         json_data = json.loads(mock_post.call_args.kwargs["data"])
         assert json_data["performanceConfig"]["latency"] == "optimized"
+
+@pytest.fixture(autouse=True)
+def set_openrouter_api_key():
+    original_api_key = os.environ.get("OPENROUTER_API_KEY")
+    os.environ["OPENROUTER_API_KEY"] = "fake-key-for-testing"
+    yield
+    if original_api_key is not None:
+        os.environ["OPENROUTER_API_KEY"] = original_api_key
+    else:
+        del os.environ["OPENROUTER_API_KEY"]
+
+
+@pytest.mark.asyncio
+async def test_extra_body_with_fallback(respx_mock: respx.MockRouter, set_openrouter_api_key):
+    """
+    test regression for https://github.com/BerriAI/litellm/issues/8425.
+
+    This was perhaps a wider issue with the acompletion function not passing kwargs such as extra_body correctly when fallbacks are specified.
+    """
+    # Set up test parameters
+    model = "openrouter/deepseek/deepseek-chat"
+    messages = [{"role": "user", "content": "Hello, world!"}]
+    extra_body = {
+        "provider": {
+            "order": ["DeepSeek"],
+            "allow_fallbacks": False,
+            "require_parameters": True
+        }
+    }
+    fallbacks = [
+        {
+            "model": "openrouter/google/gemini-flash-1.5-8b"
+        }
+    ]
+
+    respx_mock.post("https://openrouter.ai/api/v1/chat/completions").respond(
+        json={
+            "id": "chatcmpl-123",
+            "object": "chat.completion",
+            "created": 1677652288,
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "Hello from mocked response!",
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 9, "completion_tokens": 12, "total_tokens": 21},
+        }
+    )
+
+    response = await litellm.acompletion(
+        model=model,
+        messages=messages,
+        extra_body=extra_body,
+        fallbacks=fallbacks,
+        api_key="fake-openrouter-api-key",
+    )
+
+    # Get the request from the mock
+    request: httpx.Request = respx_mock.calls[0].request
+    request_body = request.read()
+    request_body = json.loads(request_body)
+
+    # Verify basic parameters
+    assert request_body["model"] == "deepseek/deepseek-chat"
+    assert request_body["messages"] == messages
+
+    # Verify the extra_body parameters remain under the provider key
+    assert request_body["provider"]["order"] == ["DeepSeek"]
+    assert request_body["provider"]["allow_fallbacks"] is False
+    assert request_body["provider"]["require_parameters"] is True
+
+    # Verify the response
+    assert response is not None
+    assert response.choices[0].message.content == "Hello from mocked response!"
+
+
+@pytest.mark.parametrize("env_base", ["OPENAI_BASE_URL", "OPENAI_API_BASE"])
+@pytest.mark.asyncio
+async def test_openai_env_base(
+    respx_mock: respx.MockRouter, env_base, openai_api_response, monkeypatch
+):
+    "This tests OpenAI env variables are honored, including legacy OPENAI_API_BASE"
+
+    expected_base_url = "http://localhost:12345/v1"
+
+    # Assign the environment variable based on env_base, and use a fake API key.
+    monkeypatch.setenv(env_base, expected_base_url)
+    monkeypatch.setenv("OPENAI_API_KEY", "fake_openai_api_key")
+
+    model = "gpt-4o"
+    messages = [{"role": "user", "content": "Hello, how are you?"}]
+
+    respx_mock.post(f"{expected_base_url}/chat/completions").respond(
+        json={
+            "id": "chatcmpl-123",
+            "object": "chat.completion",
+            "created": 1677652288,
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "Hello from mocked response!",
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 9, "completion_tokens": 12, "total_tokens": 21},
+        }
+    )
+
+    response = await litellm.acompletion(model=model, messages=messages)
+
+    # verify we had a response
+    assert response.choices[0].message.content == "Hello from mocked response!"
