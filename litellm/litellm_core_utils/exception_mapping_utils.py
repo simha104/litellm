@@ -2236,6 +2236,15 @@ def exception_type(  # type: ignore  # noqa: PLR0915
                             litellm_debug_info=extra_information,
                             response=getattr(original_exception, "response", None),
                         )
+                    elif original_exception.status_code == 404:
+                        exception_mapping_worked = True
+                        raise NotFoundError(
+                            message=f"AzureException NotFoundError - {message}",
+                            llm_provider="azure",
+                            model=model,
+                            litellm_debug_info=extra_information,
+                            response=getattr(original_exception, "response", None),
+                        )
                     elif original_exception.status_code == 408:
                         exception_mapping_worked = True
                         raise Timeout(

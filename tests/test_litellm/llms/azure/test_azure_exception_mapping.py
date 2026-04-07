@@ -10,12 +10,39 @@ sys.path.insert(
 )  # Adds the parent directory to the system path
 
 import litellm
-from litellm.exceptions import ContentPolicyViolationError
+from litellm.exceptions import ContentPolicyViolationError, NotFoundError
 from litellm.litellm_core_utils.exception_mapping_utils import exception_type
 
 
 class TestAzureExceptionMapping:
     """Test Azure OpenAI exception mapping with provider-specific fields"""
+
+    @pytest.mark.parametrize("custom_llm_provider", ["azure", "azure_text"])
+    def test_azure_404_status_maps_to_not_found_error(self, custom_llm_provider):
+        """Generic Azure 404s should map to NotFoundError instead of APIError."""
+        from litellm.llms.azure.common_utils import AzureOpenAIError
+
+        mock_response = MagicMock()
+        mock_response.status_code = 404
+        mock_exception = AzureOpenAIError(
+            status_code=404,
+            message="Resource not found",
+            response=mock_response,
+        )
+
+        with pytest.raises(NotFoundError) as exc_info:
+            exception_type(
+                model="azure/gpt-4",
+                original_exception=mock_exception,
+                custom_llm_provider=custom_llm_provider,
+            )
+
+        error = exc_info.value
+        assert "AzureException NotFoundError - Resource not found" in error.message
+        assert error.llm_provider == "azure"
+        assert error.model == "azure/gpt-4"
+        assert error.status_code == 404
+        assert error.response == mock_response
 
     def test_azure_content_policy_violation_innererror_access(self):
         """Test that Azure content policy violation exceptions provide access to innererror details"""
